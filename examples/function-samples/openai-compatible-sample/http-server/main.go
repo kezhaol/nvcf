@@ -114,6 +114,7 @@ type benchmarkTuning struct {
 type serverConfig struct {
 	maxOutputChunks int
 	defaults        controlDefaults
+	body            bodyConfig
 }
 
 // controlDefaults apply to a request that does not set the matching control.
@@ -360,11 +361,13 @@ func main() {
 		Addr:              ":8000",
 		Handler:           newRouterWithConfig(config),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       30 * time.Second,
+		ReadTimeout:       config.body.readTimeout,
 		IdleTimeout:       2 * time.Minute,
 	}
 	log.Printf("listening on %s with max output chunks %d, default TTFT %s, default ITL %s, default chunk %q",
 		server.Addr, config.maxOutputChunks, config.defaults.TTFT, config.defaults.ITL, config.defaults.Chunk)
+	log.Printf("max request bytes %d (decision routes %d), read timeout %s, request log %t",
+		config.body.limit(maxRequestBytes), config.body.limit(decisionMaxRequestBytes), config.body.readTimeout, config.body.log != nil)
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -391,7 +394,7 @@ func newRouterWithConfig(config serverConfig) http.Handler {
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) { handleMessages(w, r, config) })
 	mux.HandleFunc(decisionRoute, handleDecisions)
 	mux.HandleFunc(systemOneRoute, handleSystemOne)
-	return mux
+	return withBodyControls(config.body, mux)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -781,6 +784,11 @@ func loadServerConfig(getenv func(string) string) (serverConfig, error) {
 		}
 		config.defaults.Chunk = value
 	}
+	body, err := loadBodyConfig(getenv)
+	if err != nil {
+		return serverConfig{}, err
+	}
+	config.body = body
 	return config, nil
 }
 
@@ -1015,7 +1023,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, destination any) error {
 
 // decodeJSONBody decodes one JSON object and returns the bytes it was read from.
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, destination any) ([]byte, error) {
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, requestBodyLimit(r, maxRequestBytes)))
 	if err != nil {
 		return nil, err
 	}

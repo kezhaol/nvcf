@@ -89,6 +89,104 @@ so only a container default can make one version slower. A distinct default
 chunk for each version, such as `fast` and `slow`, shows in every response
 which version answered.
 
+## Server limits
+
+Two environment variables raise the request limits for slow or large uploads.
+No request can change them.
+
+| Environment variable | Default | Accepted values | Behavior |
+|----------------------|---------|-----------------|----------|
+| `LOAD_TESTER_MAX_REQUEST_BYTES` | 10 MiB, and 16 MiB on the decision routes | Integer bytes from 1 through 1073741824 | Largest request body on every POST route. |
+| `LOAD_TESTER_READ_TIMEOUT_MS` | `30000` | Integer milliseconds from 1 through 3600000 | Time allowed to read one request, headers and body. |
+
+A body over the limit gets the route's usual error: 400 on the OpenAI routes,
+413 on Messages and the decision routes. A read that passes the timeout fails
+like a closed connection. The routes hold the whole body in memory, except
+with the body digest, so size the container for the largest body. The second
+startup log line shows the limits.
+
+## Request body controls
+
+These header-only controls act on the raw request body before a route parses
+it. They apply to every POST route, including Messages and the decision
+routes, and never change the body. Like every `X-Load-Tester-` header, they
+turn off body controls.
+
+| Control | Header | Behavior |
+|---------|--------|----------|
+| Body digest | `X-Load-Tester-Body-Digest: true` | Read the whole body without parsing it and answer with a receipt instead of the route response. |
+| Read delay | `X-Load-Tester-Read-Delay-Ms` | Wait this long before each body read of at most 16 KiB. |
+| Read pause | `X-Load-Tester-Read-Pause-After-Bytes` and `X-Load-Tester-Read-Pause-Ms` | After this many body bytes, stop reading once for this long. Set both. |
+| Early status | `X-Load-Tester-Early-Status-Code` | Answer with this error status, from 400 through 599, before reading any body byte. |
+
+The digest receipt for the example below:
+
+```json
+{
+  "object": "load_tester.body_digest",
+  "bytes": 70052,
+  "sha256": "78428f6e0cdef39f0e754223e208faaafe1f369aa25c0b4237540eff4c54a8e5",
+  "content_length": 70052,
+  "accept": "*/*",
+  "first_byte_at": "2026-11-12T03:16:40.167Z",
+  "last_byte_at": "2026-11-12T03:16:42.167Z",
+  "eof_at": "2026-11-12T03:16:42.167Z",
+  "complete": true
+}
+```
+
+`sha256` covers the bytes exactly as received, so duplicate keys, key order
+and whitespace count. `content_length` is -1 for a chunked upload. Times are
+UTC with milliseconds. A body over the limit returns 413 and any other read
+failure returns 400, both with `complete: false` and `read_error`.
+
+Early status cannot be combined with the digest. Its body uses the route's
+error shape. On the OpenAI routes the error code is `injected_early_response`.
+The server sends it at once, even while the client is still uploading. Some
+clients, such as `curl` reading the body from standard input, show it only
+after their upload ends.
+
+Read delay and read pause slow the server's reads, so the client or a proxy
+in front sees backpressure. Delay and pause values are integer milliseconds up
+to five minutes. Without the digest, the route still answers normally after
+the slow read.
+
+The read timeout keeps running during a delay or pause, but it is only checked
+when the server next reads from the connection. If the timeout passes during a
+pause, the read after the pause fails, unless the server already holds the
+rest of the body in its buffer. Set `LOAD_TESTER_READ_TIMEOUT_MS` above the
+whole upload, pauses included.
+
+The body digest, an early status answer and a rejected control header all
+answer without running the route's handler, so `LOG_REQUESTS` logs only the
+JSON line below for them, not the route's own request log line.
+
+```bash
+python3 -c 'import sys; sys.stdout.write("{\"model\":\"test-model\",\"messages\":[]," + " " * 70000 + "\"model\":\"other\"}")' > body.json
+shasum -a 256 body.json
+curl -sS http://localhost:8000/v1/chat/completions \
+  --header 'Expect:' \
+  --header 'X-Load-Tester-Body-Digest: true' \
+  --header 'X-Load-Tester-Read-Pause-After-Bytes: 65536' \
+  --header 'X-Load-Tester-Read-Pause-Ms: 2000' \
+  --data-binary @body.json
+```
+
+With `LOG_REQUESTS=true`, every POST request to these routes also logs one
+JSON line to standard error when the handler returns. Messages, Decisions and
+System One requests keep their request log line as well. For a client that closed after
+1 MiB of a declared 8 MiB body:
+
+```json
+{"time":"2026-11-11T19:20:25.958753-08:00","level":"INFO","msg":"request body","method":"POST","path":"/v1/chat/completions","request_id":"abort-8m","content_length":8388608,"bytes":1048576,"complete":false,"first_byte_at":"2026-11-12T03:20:25.450Z","last_byte_at":"2026-11-12T03:20:25.454Z","read_error":"unexpected EOF"}
+```
+
+`request_id` and `function_id` come from the `NVCF-REQID` and
+`NVCF-FUNCTION-ID` request headers when present. `complete` is true only when
+the server read the body to its end without an error. The line also has
+`sha256` with the digest, `eof_at` for a complete body, and `early_status`
+for an early answer.
+
 ## Echo control
 
 Set `x_load_tester_echo` to `true`, or send `X-Load-Tester-Echo: true`, to
